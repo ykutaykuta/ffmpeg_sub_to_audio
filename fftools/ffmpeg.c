@@ -24,6 +24,7 @@
  */
 
 #include "config.h"
+#include "features.h"
 #include <ctype.h>
 #include <string.h>
 #include <math.h>
@@ -32,6 +33,10 @@
 #include <limits.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <sys/wait.h>
+#include <netinet/in.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 
 #if HAVE_IO_H
 #include <io.h>
@@ -156,6 +161,8 @@ int         nb_output_files   = 0;
 
 FilterGraph **filtergraphs;
 int        nb_filtergraphs;
+
+SubTTSContext *sub_tts_ctx;
 
 #if HAVE_TERMIOS_H
 
@@ -2311,6 +2318,28 @@ static int decode_audio(InputStream *ist, AVPacket *pkt, int *got_output,
                                               (AVRational){1, avctx->sample_rate}, decoded_frame->nb_samples, &ist->filter_in_rescale_delta_last,
                                               (AVRational){1, avctx->sample_rate});
     ist->nb_samples = decoded_frame->nb_samples;
+
+    /* mix subtitle tts audio */
+    if (!sub_tts_ctx->is_ready)
+    {
+        tts_setup(sub_tts_ctx, avctx);
+        goto skip_mix;
+    }
+
+    if (ff_framequeue_queued_frames(&sub_tts_ctx->sub_frame_fifo) > 0)
+    {
+        AVFrame *frame = ff_framequeue_peek(&sub_tts_ctx->sub_frame_fifo, 0);
+        if (frame->pts != AV_NOPTS_VALUE)
+            if(av_compare_ts(decoded_frame->pts, decoded_frame_tb, frame->pts, AV_TIME_BASE_Q) < 0)
+                goto skip_mix;
+        do
+        {
+            sub_tts_ctx->fc_mix(sub_tts_ctx, decoded_frame);
+        } while (ff_framequeue_queued_frames(&sub_tts_ctx->sub_frame_fifo) > 0 && sub_tts_ctx->sample_offset_a > 0);
+    }
+    
+    /* end of mixing */
+skip_mix:
     err = send_frame_to_filters(ist, decoded_frame);
 
     av_frame_unref(ist->filter_frame);
@@ -2451,6 +2480,107 @@ fail:
     return err < 0 ? err : ret;
 }
 
+static int subtitle_tts(AVSubtitle *subtitle)
+{
+    AVFormatContext *fmt_ctx;
+    AVCodecContext *dec_ctx;
+    int stream_index;
+    char *audio_uri;
+    int ret, is_the_first_frame;
+    AVPacket *packet;
+    int64_t pts;
+    uint32_t start;            // time in ms
+    AVRational time_base;
+
+    if (!sub_tts_ctx->is_ready)
+    {
+        av_log(NULL, AV_LOG_WARNING, "%s: Feature convert subtitle to audio isn't ready!\n", __func__);
+        return 0;
+    }
+
+    fmt_ctx = NULL;
+    dec_ctx = NULL;
+    stream_index = -1;
+    audio_uri = av_malloc(160);
+    ret = 0;
+    is_the_first_frame = 1;
+    packet = sub_tts_ctx->decoded_pkt;
+    pts = subtitle->pts;
+    start = subtitle->start_display_time;
+
+
+    if (ret = subtitle_to_audio(subtitle, sub_tts_ctx, audio_uri) < 0)
+    {
+        av_log(NULL, AV_LOG_ERROR, "%s: Error while call api to convert subtitle to audio fail\n", __func__);
+        goto end;
+    }
+
+    if (ret = open_input(&fmt_ctx, &dec_ctx, &stream_index, audio_uri) < 0)
+    {
+        av_log(NULL, AV_LOG_ERROR, "%s: Error while open received audio fail\n", __func__);
+        goto end;
+    }
+    // calculate offset pts
+    start += pts * 1000 / AV_TIME_BASE;   // in ms unit
+    pts = start * 1000; // in AV_TIME_BASE unit
+    time_base = fmt_ctx->streams[stream_index]->time_base;
+
+    while (1)
+    {
+        if (ret = av_read_frame(fmt_ctx, packet) < 0)
+            break;
+        if (packet->stream_index == stream_index)
+        {
+            ret = avcodec_send_packet(dec_ctx, packet);
+            if (ret < 0)
+            {
+                av_log(NULL, AV_LOG_ERROR, "%s: Error while sending a packet to the decoder\n", __func__);
+                break;
+            }
+
+            while (ret >= 0)
+            {
+                AVFrame *frame = av_frame_alloc();
+                if (!frame)
+                {
+                    ret = AVERROR(ENOMEM);
+                    goto end;
+                }
+                ret = avcodec_receive_frame(dec_ctx, frame);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF)
+                {
+                    break;
+                }
+                else if (ret < 0)
+                {
+                    av_log(NULL, AV_LOG_ERROR, "%s: Error while receiving a frame from the decoder\n", __func__);
+                    goto end;
+                }
+
+                if (ret >= 0)
+                {
+                    if (is_the_first_frame)
+                    {
+                        frame->pts = pts + av_rescale_q(frame->pts, time_base, AV_TIME_BASE_Q);
+                        is_the_first_frame = 0;
+                    }
+                    else
+                        frame->pts = AV_NOPTS_VALUE;
+                    ff_framequeue_add(&sub_tts_ctx->sub_frame_fifo, frame);
+                }
+            }
+        }
+        av_packet_unref(packet);
+    }
+
+end:
+    avcodec_free_context(&dec_ctx);
+    avformat_close_input(&fmt_ctx);
+    if (audio_uri)
+        av_freep(&audio_uri);
+    return ret;
+}
+
 static int transcode_subtitles(InputStream *ist, AVPacket *pkt, int *got_output,
                                int *decode_failed)
 {
@@ -2467,6 +2597,13 @@ static int transcode_subtitles(InputStream *ist, AVPacket *pkt, int *got_output,
             sub2video_flush(ist);
         return ret;
     }
+
+    /* convert text to audio of subtitle here */
+
+    if (subtitle_tts(&subtitle) < 0)
+        av_log(NULL, AV_LOG_WARNING, "converting subtitle to audio failed error\n");
+
+    /* end of converting */
 
     if (ist->fix_sub_duration) {
         int end = 1;
@@ -4636,7 +4773,19 @@ static int transcode(void)
     ret = transcode_init();
     if (ret < 0)
         goto fail;
-
+    
+    /* initialization of subtitle tts */
+    sub_tts_ctx = av_malloc(sizeof(*sub_tts_ctx));
+    if (!sub_tts_ctx)
+    {
+        ret = AVERROR(ENOMEM);
+        goto fail;
+    }
+    ret = tts_init(sub_tts_ctx);
+    if (ret < 0)
+        goto fail;
+    /* end of subtitle tts initialization */
+    
     if (stdin_interaction) {
         av_log(NULL, AV_LOG_INFO, "Press [q] to stop, [?] for help\n");
     }
@@ -4765,6 +4914,10 @@ static int transcode(void)
             }
         }
     }
+    /* deinit subtitle tts */
+    tts_cleanup(sub_tts_ctx);
+    av_freep(&sub_tts_ctx);
+    /* end of deinit */
     return ret;
 }
 

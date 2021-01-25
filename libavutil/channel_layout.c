@@ -285,3 +285,14 @@ int av_get_standard_channel_layout(unsigned index, uint64_t *layout,
     if (name)   *name   = channel_layout_map[index].name;
     return 0;
 }
+
+const char *av_get_channel_layout_name(uint64_t layout)
+{
+    int i;
+    for (i = 0; i < FF_ARRAY_ELEMS(channel_layout_map); i++)
+    {
+        if (channel_layout_map[i].layout == layout)
+            return channel_layout_map[i].name;
+    }
+    return channel_layout_map[0].name;
+}
